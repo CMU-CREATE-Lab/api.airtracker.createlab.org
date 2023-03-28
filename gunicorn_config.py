@@ -1,6 +1,8 @@
 import multiprocessing
 
-workers = 3
+workers = 6
+# 2 minutes
+timeout = 120
 bind = 'unix:airtrackerapi.sock'
 #umask = 0o002
 reload = True

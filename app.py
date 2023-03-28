@@ -1,8 +1,10 @@
+#from time import strftime
+from urllib.parse import unquote
 from flask import Flask, request, make_response
 #from quart import Quart, request
 #from aioflask import Flask, request
 from flask import send_file
-from io import BytesIO, StringIO
+from io import BytesIO
 from PIL import Image
 import json
 import requests
@@ -12,6 +14,12 @@ import gzip, netCDF4
 import asyncio
 from aiohttp import ClientSession
 import base64
+import matplotlib
+from dateutil.rrule import *
+from datetime import timezone
+from datetime import datetime as dt
+
+from dateutil.tz import gettz
 #import time
 #import multiprocessing as mp
 
@@ -25,7 +33,7 @@ from heatmap_footprint import Footprint
 MAP_WIDTH_PIXELS = 640
 MAP_HEIGHT_PIXELS = 597
 
-NUM_REQUESTS_IN_PARALLEL = 24
+NUM_REQUESTS_IN_PARALLEL = 25
 MAX_NUM_DATES_TO_PARSE = 750
 
 app = Flask(__name__)
@@ -53,13 +61,19 @@ def get_footprint():
 
     [map_center, map_zoom] = get_formatted_view(view_obj)
 
-    # TODO: Change time format to either epoch time or ISO8601 basic, which is YYYYMMDDThhmmssZ (no punctuation)
-    # Currently we are using modified ISO8601 that uses all hyphens (no colons) since this is the naming scheme used for the footprint files on cloud storage
+    # Dates come in is ISO8601 format
     time = request.args.get('time') or request.args.get('t')
+    tz = request.args.get('tz')
+
     if not time:
-        return return_error("time parameter (time=YYYY-MM-DDTHH-MM-SS) is required.")
-    elif re.match(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}-[0-9]{2}-[0-9]{2}$", time) is None:
-        return return_error("Malformed time parameter. Required format: (time=YYYY-MM-DDTHH-MM-SS)")
+        return return_error("time parameter (time=YYYY-MM-DDTHH:MM) is required.")
+    elif re.match(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}$", time) is None:
+        return return_error("Malformed time parameter. Required format: (time=YYYY-MM-DDTHH:MM)")
+    elif tz is None:
+        return return_error(f"When passing in a list of dates, tz info is required (e.g. America/New_York)")
+
+    # Convert to UTC (based on the tz info passed in) and also format to the expected format of footprints stored on GCS.
+    time = dt.strftime(dt.strptime(time, '%Y-%m-%dT%H:%M').replace(tzinfo=gettz(tz)).astimezone(timezone.utc), "%Y-%m-%dT%H-00-00")
 
     show_basemap = request.args.get('showBasemap', default=True, type=lambda v: v.lower() == 'true')
     show_contribution_likelihoods = request.args.get('showContributionLikelihoods', default=False, type=lambda v: v.lower() == 'true')
@@ -117,6 +131,10 @@ def get_footprint():
 
     if show_basemap:
         background = Image.open(base_map).convert('RGBA')
+        if show_contribution_likelihoods:
+            # Add opacity to overlay; modifies passed in image
+            alter_overlay_opacity(transformed_overlay, 0.80)
+        # composite new overlay with the background
         final_output = Image.alpha_composite(background, transformed_overlay)
 
     return serve_image_from_memory(image=final_output)
@@ -134,43 +152,63 @@ async def get_heatmap():
 
     [map_center, map_zoom] = get_formatted_view(view_obj)
 
-    # TODO: Change time format to either epoch time or ISO8601 basic, which is YYYYMMDDThhmmssZ (no puncuation)
-    # Currently we are using modified ISO8601 that uses all hyphens (no colons) since this is the naming scheme used for the footprint files on cloud storage
+    # Dates come in is ISO8601 format
     times = request.args.get('times') or request.args.get('ts')
-    if not times:
-        return return_error("times parameter (times=YYYY-MM-DDTHH-MM-SS,...) is required.")
-    elif len(times) > MAX_NUM_DATES_TO_PARSE:
-        return return_error(f"Too many dates passed in. Max of {MAX_NUM_DATES_TO_PARSE} is allowed.")
-    elif re.match(r"^([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}-[0-9]{2}-[0-9]{2},?){2,}$", times) is None:
-        return return_error("Malformed times parameter. Required format: List of DateTimes (times=YYYY-MM-DDTHH-MM-SS,...) with minimum of two DateTimes.")
+    # We also support rrule expression to generate list of dates on the server side
+    rrule = request.args.get('rrule')
+    timestamps = []
+
+    if times:
+        tz = request.args.get('tz')
+
+        if len(times) > MAX_NUM_DATES_TO_PARSE:
+            return return_error(f"Too many dates passed in. Max of {MAX_NUM_DATES_TO_PARSE} is allowed.")
+        elif re.match(r"^([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2},?){2,}$", times) is None:
+            return return_error("Malformed times parameter. Required format: List of DateTimes (times=YYYY-MM-DDTHH:MM,...) with minimum of two DateTimes.")
+        elif tz is None:
+            return return_error(f"When passing in a list of dates, tz info is required (e.g. America/New_York)")
+
+        tmp_timestamps = times.split(",")
+        # Convert to UTC (based on the tz info passed in) and also format to the expected format of footprints stored on GCS.
+        for date in tmp_timestamps:
+            timestamps.append(dt.strftime(dt.strptime(date, '%Y-%m-%dT%H:%M').replace(tzinfo=gettz(tz)).astimezone(timezone.utc), "%Y-%m-%dT%H-00-00"))
+    elif rrule:
+        # TODO: Check validity of RRule
+        rrule = unquote(rrule)
+        # DSTART is timezone aware, so we convert to UTC for lookups on GSC
+        timestamps = list(dt.strftime(date.astimezone(timezone.utc), "%Y-%m-%dT%H-00-00") for date in rrulestr(rrule))
+
+        if len(timestamps) > MAX_NUM_DATES_TO_PARSE:
+            return return_error(f"Too many dates passed in. Max of {MAX_NUM_DATES_TO_PARSE} is allowed.")
+    else:
+        return return_error("times parameter (times=YYYY-MM-DDTHH:MM,...) or RRULE is required.")
+
     show_basemap = request.args.get('showBasemap', default=True, type=lambda v: v.lower() == 'true')
 
     map_url = f"https://maps.googleapis.com/maps/api/staticmap?center={map_center['lat']},{map_center['lon']}&zoom={map_zoom}&size={MAP_WIDTH_PIXELS}x{MAP_HEIGHT_PIXELS}&scale=1&key={credentials['google_api']}"
-
-    timestamps = times.split(",")
 
     for_overlay = request.args.get('forOverlay')
 
     # Get all files
     async with ClientSession() as session:
-      raw_files = await gather_with_concurrency(NUM_REQUESTS_IN_PARALLEL, *[get_netcdf_footprint(time=timestamp, location=map_center, session=session) for timestamp in timestamps])
+      netcdf_files = await gather_with_concurrency(NUM_REQUESTS_IN_PARALLEL, *[get_and_read_netcdf_footprint(time=timestamp, location=map_center, session=session) for timestamp in timestamps])
 
     num_processed_timestamps = 0
     first = True
     mean_dataset = None
     sum = None
 
-    for idx, raw_f in enumerate(raw_files):
-        if raw_f is None:
+    for idx, netcdf in enumerate(netcdf_files):
+        if netcdf is None:
             continue
-        f = read_compressed_netcdf_footprint(raw_f)
-        footprint = f.variables['foot'][:]
+        #f = read_compressed_netcdf_footprint(netcdf)
+        footprint = netcdf.variables['foot'][:]
 
         if first:
              # TODO: xmin|xmax|ymin|ymax in the metadata is only written out to the footprint and not stored in the netcdf. It's pulled from simulation.config section of domains.yaml
             footprint_metadata_url = f"https://storage.googleapis.com/storage/v1/b/air-tracker-edf-prod/o/by-simulation-id%2F{timestamps[idx]}%2F{map_center['lon']}%2F{map_center['lat']}%2F1%2Ffootprint.png"
             sum = footprint
-            mean_dataset = f
+            mean_dataset = netcdf
             first = False
         else:
             sum += footprint
@@ -181,7 +219,21 @@ async def get_heatmap():
 
     mean = sum / num_processed_timestamps
     mean_dataset.variables['foot'] = mean
-    png_bytes = Footprint(mean_dataset).create_image(log10=True, cmap="BuPu", vmin=-4, vmax=0)
+
+    #colors = ['#F9F9F9', '#FFDB9D', '#FE9367', '#D7456D', '#7E2482', '#430F75']
+    #colors = ['#F9F9F9', '#07EFF7', '#658CF8', '#7C14F5', '#B71AF5', '#FB23F5']
+    colors = ['#F9F9F9','#07EFF7','#658CF8','#658CF8','#7C14F5','#7C14F5','#B71AF5','#B71AF5','#FB23F5','#FB23F5','#FB23F5']
+    cmap = matplotlib.colors.LinearSegmentedColormap.from_list('custom_cmap', colors)
+    #cmap = "BuPu"
+
+    if request.args.get('colormapList'):
+      tmp = request.args.get('colormapList').replace(" ", "").split(",")
+      if (len(tmp) > 1):
+        colors =  ["#" + color for color in tmp]
+        #cmap = matplotlib.colors.ListedColormap(colors, name='custom_cmap')
+        cmap = matplotlib.colors.LinearSegmentedColormap.from_list('custom_cmap', colors)
+
+    png_bytes = Footprint(mean_dataset).create_image(log10=True, cmap=cmap, vmin=-4, vmax=0)
 
     footprint_metadata = requests.get(footprint_metadata_url, stream=True).json()
 
@@ -205,6 +257,9 @@ async def get_heatmap():
 
         if show_basemap:
             background = Image.open(base_map).convert('RGBA')
+            # Add opacity to overlay; modifies passed in image
+            alter_overlay_opacity(transformed_overlay, 0.80)
+            # composite new overlay with the background
             final_output = Image.alpha_composite(background, transformed_overlay)
 
         return serve_image_from_memory(image=final_output)
@@ -228,7 +283,7 @@ def get_formatted_view(view_obj):
     latTrunc = str(round(input_lat,2))
     # Footprints are being stored in the bucket by lat/lon with 2 digit precision. Sorta.
     # If the two digit precision ends with trailing zero in the second digit, it is removed.
-    # Note: No need to deal with this, since in python round will not zero pad the end, unlick in JS with toFixed
+    # Note: No need to deal with this, since in python round will not zero pad the end, unlike in JS with toFixed
     # if (latTrunc.split(".")[1][1] == "0"):
     #     latTrunc = latTrunc[:-1]
     latOffset = input_lat - float(latTrunc)
@@ -236,7 +291,7 @@ def get_formatted_view(view_obj):
     lonTrunc = str(round(input_lon, 2))
     # Footprints are being stored in the bucket by lat/lon with 2 digit precision. Sorta.
     # If the two digit precision ends with trailing zero in the *second* digit, it is removed.
-    # Note: No need to deal with this, since in python round will not zero pad the end, unlick in JS with toFixed
+    # Note: No need to deal with this, since in python round will not zero pad the end, unlike in JS with toFixed
     # if (lonTrunc.split(".")[1][1] == "0"):
     #     lonTrunc = lonTrunc[:-1]
     lonOffset = input_lon - float(lonTrunc)
@@ -244,6 +299,15 @@ def get_formatted_view(view_obj):
     map_center = {"lat": float(latTrunc), "lon": float(lonTrunc)}
     map_zoom = input_zoom
     return [map_center, map_zoom]
+
+
+def alter_overlay_opacity(overlay, opacity):
+    # Create a copy of the overlay
+    tmp = overlay.copy()
+    # Put alpha on the copy at 80%
+    tmp.putalpha(round(255 * opacity))
+    # merge overlay with mask
+    return overlay.paste(tmp, overlay)
 
 
 def get_transformed_overlay(map_center, map_zoom, footprint_metadata, new_footprint, show_contribution_likelihoods):
@@ -330,6 +394,13 @@ def pixel_xy_to_lonlat(x, y):
     return {"lon":lon, "lat":lat}
 
 
+async def get_and_read_netcdf_footprint(netcdf_footprint_url=None, time=None, location=None, session=None):
+    compressed_netcdf_data = await get_netcdf_footprint(netcdf_footprint_url, time, location, session)
+    if compressed_netcdf_data is None:
+        return None
+    return read_compressed_netcdf_footprint(compressed_netcdf_data)
+
+
 async def get_netcdf_footprint(netcdf_footprint_url=None, time=None, location=None, session=None):
   if not netcdf_footprint_url:
     netcdf_footprint_url = f"https://storage.googleapis.com/download/storage/v1/b/air-tracker-edf-prod/o/by-simulation-id%2F{time}%2F{location['lon']}%2F{location['lat']}%2F1%2Ffootprint.nc.gz?alt=media"
@@ -346,31 +417,31 @@ async def get_netcdf_footprint(netcdf_footprint_url=None, time=None, location=No
       return None
 
 
-def extract_footprint(compressed_netcdf_footprint):
-    return gzip.decompress(compressed_netcdf_footprint)
-
-
 def read_compressed_netcdf_footprint(compressed_netcdf_footprint):
   uncompressed = gzip.decompress(compressed_netcdf_footprint)
   return netCDF4.Dataset('footprint.nc', memory=uncompressed)
 
 
-async def read_netcdf_footprint(netcdf_footprint_url=None, time=None, location=None):
-  if not netcdf_footprint_url:
-    netcdf_footprint_url = f"https://storage.googleapis.com/download/storage/v1/b/air-tracker-edf-prod/o/by-simulation-id%2F{time}%2F{location['lon']}%2F{location['lat']}%2F1%2Ffootprint.nc.gz?alt=media"
-  else:
-    assert(not time)
-    assert(not location)
+# def extract_footprint(compressed_netcdf_footprint):
+#     return gzip.decompress(compressed_netcdf_footprint)
 
-  try:
-    response = requests.get(netcdf_footprint_url)
-    response.raise_for_status()
-  except requests.exceptions.HTTPError as e:
-    return None
 
-  compressed = response.content
-  uncompressed = gzip.decompress(compressed)
-  return netCDF4.Dataset('footprint.nc', memory=uncompressed)
+# async def read_netcdf_footprint(netcdf_footprint_url=None, time=None, location=None):
+#   if not netcdf_footprint_url:
+#     netcdf_footprint_url = f"https://storage.googleapis.com/download/storage/v1/b/air-tracker-edf-prod/o/by-simulation-id%2F{time}%2F{location['lon']}%2F{location['lat']}%2F1%2Ffootprint.nc.gz?alt=media"
+#   else:
+#     assert(not time)
+#     assert(not location)
+
+#   try:
+#     response = requests.get(netcdf_footprint_url)
+#     response.raise_for_status()
+#   except requests.exceptions.HTTPError as e:
+#     return None
+
+#   compressed = response.content
+#   uncompressed = gzip.decompress(compressed)
+#   return netCDF4.Dataset('footprint.nc', memory=uncompressed)
 
 
 if __name__ == '__main__':
