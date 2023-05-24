@@ -14,6 +14,8 @@ from netCDF4 import Dataset  # type: ignore
 
 from heatmap_grid import Grid
 
+from PIL import Image as im
+
 matplotlib.use("Agg")
 
 
@@ -131,6 +133,7 @@ class Footprint:
             bytes: bytes representation of png image.
         """
         image = self.values
+
         while len(image.shape) > 2:
             image = image.sum(axis=0)
 
@@ -146,14 +149,28 @@ class Footprint:
         if vmin:
             image[image < vmin] = np.nan
 
-        plt.imshow(image, *args, **kwargs)
-        plt.axis("off")
+        # Create masked alpha based on nans
+        alpha = ~np.isnan(image)
 
-        f = io.BytesIO()
-        plt.savefig(f, bbox_inches="tight", dpi=300, pad_inches=0, transparent=True)
-        plt.close()
+        image = image[:, :, 0]
+        vmax = kwargs.get("vmax")
 
-        return f.getvalue()
+        # Normalize image to the range [0, 255]
+        image = ((image - vmin) / (vmax - vmin)) * 255.0
+        image = np.nan_to_num(image).astype(np.uint8)
+
+        # Apply colormap
+        cmap = plt.get_cmap(kwargs.get('cmap'))
+        image_colored = cmap(image)
+
+        # Convert to PIL Image
+        image_colored[:, :, 3] = alpha[:, :, 0]
+        image_pil = im.fromarray((image_colored * 255.0).astype(np.uint8))
+
+        img_byte_arr = io.BytesIO()
+        image_pil.save(img_byte_arr, format='PNG', compress_level=2)
+
+        return img_byte_arr.getvalue()
 
     def _validate_raster_attributes(self, x):
         """Ensure cell-by-cell operations are valid"""
