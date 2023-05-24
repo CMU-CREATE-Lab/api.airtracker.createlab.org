@@ -1,8 +1,5 @@
-#from time import strftime
 from urllib.parse import unquote
 from flask import Flask, request, make_response
-#from quart import Quart, request
-#from aioflask import Flask, request
 from flask import send_file
 from io import BytesIO
 from PIL import Image
@@ -15,19 +12,15 @@ import asyncio
 from aiohttp import ClientSession
 import base64
 import matplotlib
-from dateutil.rrule import *
+from dateutil.rrule import rrulestr
 from datetime import timezone
 from datetime import datetime as dt
-
 from dateutil.tz import gettz
-#import time
-#import multiprocessing as mp
-
-from utils.utils import *
+from utils.utils import reload_module
 reload_module('heatmap_grid')
 reload_module('heatmap_footprint')
 from heatmap_footprint import Footprint
-
+from timezonefinder import TimezoneFinder
 
 # TODO: User can set output image size?
 MAP_WIDTH_PIXELS = 640
@@ -64,6 +57,10 @@ def get_footprint():
     # Dates come in is ISO8601 format
     time = request.args.get('time') or request.args.get('t')
     tz = request.args.get('tz')
+
+    if not tz:
+        tz_finder = TimezoneFinder()
+        tz = tz_finder.timezone_at(lat=map_center['lat'], lng=map_center['lon'])
 
     if not time:
         return return_error("time parameter (time=YYYY-MM-DDTHH:MM) is required.")
@@ -161,17 +158,23 @@ async def get_heatmap():
     if times:
         tz = request.args.get('tz')
 
+        if not tz:
+            tz_finder = TimezoneFinder()
+            tz = tz_finder.timezone_at(lat=map_center['lat'], lng=map_center['lon'])
+
         if len(times) > MAX_NUM_DATES_TO_PARSE:
             return return_error(f"Too many dates passed in. Max of {MAX_NUM_DATES_TO_PARSE} is allowed.")
-        elif re.match(r"^([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2},?){2,}$", times) is None:
+        elif re.match(r"^([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}\s*,?\s*){2,}$", times) is None:
             return return_error("Malformed times parameter. Required format: List of DateTimes (times=YYYY-MM-DDTHH:MM,...) with minimum of two DateTimes.")
         elif tz is None:
             return return_error(f"When passing in a list of dates, tz info is required (e.g. America/New_York)")
 
-        tmp_timestamps = times.split(",")
+        tmp_timestamps = times.replace(" ", "").split(",")
         # Convert to UTC (based on the tz info passed in) and also format to the expected format of footprints stored on GCS.
         for date in tmp_timestamps:
-            timestamps.append(dt.strftime(dt.strptime(date, '%Y-%m-%dT%H:%M').replace(tzinfo=gettz(tz)).astimezone(timezone.utc), "%Y-%m-%dT%H-00-00"))
+            # It's possible we have an empty date after the above split because of a trailing comma at the end of the passed in date string
+            if date:
+                timestamps.append(dt.strftime(dt.strptime(date, '%Y-%m-%dT%H:%M').replace(tzinfo=gettz(tz)).astimezone(timezone.utc), "%Y-%m-%dT%H-00-00"))
     elif rrule:
         # TODO: Check validity of RRule
         rrule = unquote(rrule)
@@ -421,27 +424,6 @@ def read_compressed_netcdf_footprint(compressed_netcdf_footprint):
   uncompressed = gzip.decompress(compressed_netcdf_footprint)
   return netCDF4.Dataset('footprint.nc', memory=uncompressed)
 
-
-# def extract_footprint(compressed_netcdf_footprint):
-#     return gzip.decompress(compressed_netcdf_footprint)
-
-
-# async def read_netcdf_footprint(netcdf_footprint_url=None, time=None, location=None):
-#   if not netcdf_footprint_url:
-#     netcdf_footprint_url = f"https://storage.googleapis.com/download/storage/v1/b/air-tracker-edf-prod/o/by-simulation-id%2F{time}%2F{location['lon']}%2F{location['lat']}%2F1%2Ffootprint.nc.gz?alt=media"
-#   else:
-#     assert(not time)
-#     assert(not location)
-
-#   try:
-#     response = requests.get(netcdf_footprint_url)
-#     response.raise_for_status()
-#   except requests.exceptions.HTTPError as e:
-#     return None
-
-#   compressed = response.content
-#   uncompressed = gzip.decompress(compressed)
-#   return netCDF4.Dataset('footprint.nc', memory=uncompressed)
 
 
 if __name__ == '__main__':
