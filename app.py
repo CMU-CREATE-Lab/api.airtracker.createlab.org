@@ -21,6 +21,7 @@ reload_module('heatmap_grid')
 reload_module('heatmap_footprint')
 from heatmap_footprint import Footprint
 from timezonefinder import TimezoneFinder
+import logging
 
 # TODO: User can set output image size?
 MAP_WIDTH_PIXELS = 640
@@ -34,6 +35,20 @@ app = Flask(__name__)
 # TODO: Store in a different way?
 credentials = json.load(open("credentials.json"))
 
+# Logging setup
+logging.basicConfig(filename='logging.log', level=logging.DEBUG, format=f'%(asctime)s %(levelname)s %(name)s %(threadName)s : %(message)s')
+
+# Any error we don't explicitly catch in our code falls to here
+@app.errorhandler(Exception)
+def exception_fallback_handler(error):
+    error_message = str(error.args[0])
+    logging.error(error)
+    if 'day is out of range' in error_message or 'does not match format' in error_message:
+        return return_error("Error parsing dates. Check that list contains valid dates.")
+    elif 'operands could not be broadcast together with shapes' in error_message:
+        return return_error("Discrepancy between footprint sizes for chosen dates. Please send the list of dates to an EDF contact for analysis. In the meantime, try again with a different set of dates.")
+    else:
+        return return_error("Unknown error occurred. Please reach out to support.")
 
 # The route() function of the Flask class is a decorator,
 # which tells the application which URL should call
@@ -52,7 +67,7 @@ def get_footprint():
     if len(view_obj) < 3:
         return return_error("Malformed view parameter. Required format: (view=lat,lon,zoom)")
 
-    [map_center, map_zoom] = get_formatted_view(view_obj)
+    [map_center, map_zoom, latOffset, lonOffset] = get_formatted_view(view_obj)
 
     # Dates come in is ISO8601 format
     time = request.args.get('time') or request.args.get('t')
@@ -122,7 +137,7 @@ def get_footprint():
                         a = max(0, 255 - s * gain)
                 new_pixel_map[x,y] = (r,g,b,a)
 
-    transformed_overlay = get_transformed_overlay(map_center, map_zoom, footprint_metadata, new_footprint, show_contribution_likelihoods)
+    transformed_overlay = get_transformed_overlay(map_center, map_zoom, footprint_metadata, new_footprint, show_contribution_likelihoods, latOffset, lonOffset)
 
     final_output = transformed_overlay
 
@@ -147,7 +162,7 @@ async def get_heatmap():
     if len(view_obj) < 3:
         return return_error("Malformed view parameter. Required format: (view=lat,lon,zoom)")
 
-    [map_center, map_zoom] = get_formatted_view(view_obj)
+    [map_center, map_zoom, latOffset, lonOffset] = get_formatted_view(view_obj)
 
     # Dates come in is ISO8601 format
     times = request.args.get('times') or request.args.get('ts')
@@ -162,16 +177,20 @@ async def get_heatmap():
             tz_finder = TimezoneFinder()
             tz = tz_finder.timezone_at(lat=map_center['lat'], lng=map_center['lon'])
 
-        if len(times) > MAX_NUM_DATES_TO_PARSE:
-            return return_error(f"Too many dates passed in. Max of {MAX_NUM_DATES_TO_PARSE} is allowed.")
-        elif re.match(r"^([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}\s*,?\s*){2,}$", times) is None:
+        regex_date_pattern = r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}"
+        if re.match(fr"^({regex_date_pattern})(,{regex_date_pattern})+,?$", times) is None:
             return return_error("Malformed times parameter. Required format: List of DateTimes (times=YYYY-MM-DDTHH:MM,...) with minimum of two DateTimes.")
         elif tz is None:
-            return return_error(f"When passing in a list of dates, tz info is required (e.g. America/New_York)")
+            return return_error("When passing in a list of dates, tz info is required (e.g. America/New_York)")
 
-        tmp_timestamps = times.replace(" ", "").split(",")
+        # Create a datetime string list from the query string, removing duplicates from it (via the set method)
+        tmp_times_list = list(set(times.replace(" ", "").split(",")))
+
+        if len(tmp_times_list) > MAX_NUM_DATES_TO_PARSE:
+            return return_error(f"Too many dates passed in. Max of {MAX_NUM_DATES_TO_PARSE} is allowed.")
+
         # Convert to UTC (based on the tz info passed in) and also format to the expected format of footprints stored on GCS.
-        for date in tmp_timestamps:
+        for date in tmp_times_list:
             # It's possible we have an empty date after the above split because of a trailing comma at the end of the passed in date string
             if date:
                 timestamps.append(dt.strftime(dt.strptime(date, '%Y-%m-%dT%H:%M').replace(tzinfo=gettz(tz)).astimezone(timezone.utc), "%Y-%m-%dT%H-00-00"))
@@ -254,7 +273,7 @@ async def get_heatmap():
         # TODO: Check if Google response valid?
         base_map = requests.get(map_url, stream=True).raw if show_basemap else None
 
-        transformed_overlay = get_transformed_overlay(map_center, map_zoom, footprint_metadata, new_footprint, True)
+        transformed_overlay = get_transformed_overlay(map_center, map_zoom, footprint_metadata, new_footprint, True, latOffset, lonOffset)
 
         final_output = transformed_overlay
 
@@ -301,7 +320,7 @@ def get_formatted_view(view_obj):
 
     map_center = {"lat": float(latTrunc), "lon": float(lonTrunc)}
     map_zoom = input_zoom
-    return [map_center, map_zoom]
+    return [map_center, map_zoom, latOffset, lonOffset]
 
 
 def alter_overlay_opacity(overlay, opacity):
@@ -313,7 +332,7 @@ def alter_overlay_opacity(overlay, opacity):
     return overlay.paste(tmp, overlay)
 
 
-def get_transformed_overlay(map_center, map_zoom, footprint_metadata, new_footprint, show_contribution_likelihoods):
+def get_transformed_overlay(map_center, map_zoom, footprint_metadata, new_footprint, show_contribution_likelihoods, latOffset, lonOffset):
     center_mercator = lonlat_to_pixel_xy(map_center['lon'], map_center['lat'])
     map_mercator = {
         "west":  center_mercator[0] - (MAP_WIDTH_PIXELS / 2.0) / (2 ** map_zoom),
@@ -322,12 +341,12 @@ def get_transformed_overlay(map_center, map_zoom, footprint_metadata, new_footpr
         "south": center_mercator[1] + (MAP_HEIGHT_PIXELS / 2.0) / (2 ** map_zoom)
     }
 
-    # TODO: Do we need to deal with the lat/lon offset of truncating from earlier? We do this on the web version of showing these footprints.
+    # Convert to pixel coords. Also, handle offsets after truncating from original location in get_formatted_view()
     overlay_mercator = {
-        "west": lonlat_to_pixel_xy(float(footprint_metadata["metadata"]["xmin"]), float(footprint_metadata["metadata"]["ymin"]))[0],
-        "east": lonlat_to_pixel_xy(float(footprint_metadata["metadata"]["xmax"]), float(footprint_metadata["metadata"]["ymax"]))[0],
-        "north": lonlat_to_pixel_xy(float(footprint_metadata["metadata"]["xmax"]), float(footprint_metadata["metadata"]["ymax"]))[1],
-        "south": lonlat_to_pixel_xy(float(footprint_metadata["metadata"]["xmin"]), float(footprint_metadata["metadata"]["ymin"]))[1]
+        "west": lonlat_to_pixel_xy(float(footprint_metadata["metadata"]["xmin"]) + lonOffset, float(footprint_metadata["metadata"]["ymin"]) + latOffset)[0],
+        "east": lonlat_to_pixel_xy(float(footprint_metadata["metadata"]["xmax"]) + lonOffset, float(footprint_metadata["metadata"]["ymax"]) + latOffset)[0],
+        "north": lonlat_to_pixel_xy(float(footprint_metadata["metadata"]["xmax"]) + lonOffset, float(footprint_metadata["metadata"]["ymax"]) + latOffset)[1],
+        "south": lonlat_to_pixel_xy(float(footprint_metadata["metadata"]["xmin"]) + lonOffset, float(footprint_metadata["metadata"]["ymin"]) + latOffset)[1]
     }
 
     overlay_width_pixels = new_footprint.width
