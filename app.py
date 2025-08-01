@@ -22,6 +22,7 @@ reload_module('heatmap_footprint')
 from heatmap_footprint import Footprint
 from timezonefinder import TimezoneFinder
 import logging
+import yaml
 
 # TODO: User can set output image size?
 MAP_WIDTH_PIXELS = 640
@@ -41,8 +42,8 @@ logging.basicConfig(filename='logging.log', level=logging.DEBUG, format=f'%(asct
 # Any error we don't explicitly catch in our code falls to here
 @app.errorhandler(Exception)
 def exception_fallback_handler(error):
-    error_message = str(error.args[0])
-    logging.error(error)
+    error_message = str(error.args[0]) if error.args else str(error)
+    logging.exception("Unhandled exception caught in Flask error handler")
     if 'day is out of range' in error_message or 'does not match format' in error_message:
         return return_error("Error parsing dates. Check that list contains valid dates.")
     elif 'operands could not be broadcast together with shapes' in error_message:
@@ -159,10 +160,13 @@ async def get_heatmap():
         return return_error("view parameter (view=lat,lon,zoom) is required.")
 
     view_obj = view.split(",")
-    if len(view_obj) < 3:
+    if len(view_obj) < 3 or len(view_obj) > 3:
         return return_error("Malformed view parameter. Required format: (view=lat,lon,zoom)")
 
     [map_center, map_zoom, latOffset, lonOffset] = get_formatted_view(view_obj)
+
+    domain = request.args.get('region')
+    is_real_time = request.args.get('isRealTime', 'false').lower() == 'true'
 
     # Dates come in is ISO8601 format
     times = request.args.get('times') or request.args.get('ts')
@@ -213,7 +217,7 @@ async def get_heatmap():
 
     # Get all files
     async with ClientSession() as session:
-      netcdf_files = await gather_with_concurrency(NUM_REQUESTS_IN_PARALLEL, *[get_and_read_netcdf_footprint(time=timestamp, location=map_center, session=session) for timestamp in timestamps])
+      netcdf_files = await gather_with_concurrency(NUM_REQUESTS_IN_PARALLEL, *[get_and_read_netcdf_footprint(time=timestamp, location=map_center, session=session, domain=domain, is_real_time=is_real_time) for timestamp in timestamps])
 
     num_processed_timestamps = 0
     first = True
@@ -227,8 +231,10 @@ async def get_heatmap():
         footprint = netcdf.variables['foot'][:]
 
         if first:
-             # TODO: xmin|xmax|ymin|ymax in the metadata is only written out to the footprint and not stored in the netcdf. It's pulled from simulation.config section of domains.yaml
-            footprint_metadata_url = f"https://storage.googleapis.com/storage/v1/b/air-tracker-edf-prod/o/by-simulation-id%2F{timestamps[idx]}%2F{map_center['lon']}%2F{map_center['lat']}%2F1%2Ffootprint.png"
+            # TODO: xmin|xmax|ymin|ymax in the metadata is only written out to the footprint and not stored in the netcdf. It's pulled from simulation.config section of domains.yaml
+            # Once the live EDF site is updated, we can use the domain_config logic that realtime uses
+            if not is_real_time:
+                footprint_metadata_url = f"https://storage.googleapis.com/storage/v1/b/air-tracker-edf-prod/o/by-simulation-id%2F{timestamps[idx]}%2F{map_center['lon']}%2F{map_center['lat']}%2F1%2Ffootprint.png"
             sum = footprint
             mean_dataset = netcdf
             first = False
@@ -257,7 +263,22 @@ async def get_heatmap():
 
     png_bytes = Footprint(mean_dataset).create_image(log10=True, cmap=cmap, vmin=-4, vmax=0)
 
-    footprint_metadata = requests.get(footprint_metadata_url, stream=True).json()
+    if is_real_time:
+        domain_config = load_configmap_from_url("https://storage.googleapis.com/air-tracker-edf-website/prod/assets/data/cities/domains.yaml")
+        footprint_metadata = domain_config["data"][f"{domain}.yaml"]["simulation_config"]
+        # Website expect xmin not xmn, etc
+        key_map = {
+            "xmn": "xmin",
+            "xmx": "xmax",
+            "ymn": "ymin",
+            "ymx": "ymax"
+        }
+        for old_key, new_key in key_map.items():
+            if old_key in footprint_metadata:
+                footprint_metadata[new_key] = footprint_metadata.pop(old_key)
+        footprint_metadata = {'metadata': footprint_metadata}
+    else:
+        footprint_metadata = requests.get(footprint_metadata_url, stream=True).json()
 
     if for_overlay:
         b64_string = f'data:image/png;base64,' + base64.b64encode(png_bytes).decode('utf8')
@@ -416,16 +437,28 @@ def pixel_xy_to_lonlat(x, y):
     return {"lon":lon, "lat":lat}
 
 
-async def get_and_read_netcdf_footprint(netcdf_footprint_url=None, time=None, location=None, session=None):
-    compressed_netcdf_data = await get_netcdf_footprint(netcdf_footprint_url, time, location, session)
-    if compressed_netcdf_data is None:
+async def get_and_read_netcdf_footprint(netcdf_footprint_url=None, time=None, location=None, session=None, domain=None, is_real_time=False):
+    netcdf_data = await get_netcdf_footprint(netcdf_footprint_url, time, location, session, domain, is_real_time)
+    if netcdf_data is None:
         return None
-    return read_compressed_netcdf_footprint(compressed_netcdf_data)
+
+    if is_real_time:
+        return read_base64_netcdf_footprint(netcdf_data)
+    else:
+        return read_compressed_netcdf_footprint(netcdf_data)
 
 
-async def get_netcdf_footprint(netcdf_footprint_url=None, time=None, location=None, session=None):
+
+async def get_netcdf_footprint(netcdf_footprint_url=None, time=None, location=None, session=None, domain=None, is_real_time=False):
   if not netcdf_footprint_url:
-    netcdf_footprint_url = f"https://storage.googleapis.com/download/storage/v1/b/air-tracker-edf-prod/o/by-simulation-id%2F{time}%2F{location['lon']}%2F{location['lat']}%2F1%2Ffootprint.nc.gz?alt=media"
+    if is_real_time:
+        date_part, time_part = time.split('T')
+        year, month, day = date_part.split('-')
+        hour = time_part.split('-')[0]
+        formatted_time = year + month + day + hour
+        netcdf_footprint_url = f"https://api2.airtracker.createlab.org/get_footprint?lat={location['lat']}&lon={location['lon']}&time={formatted_time}&region={domain}&asNetCDF=true"
+    else:
+        netcdf_footprint_url = f"https://storage.googleapis.com/download/storage/v1/b/air-tracker-edf-prod/o/by-simulation-id%2F{time}%2F{location['lon']}%2F{location['lat']}%2F1%2Ffootprint.nc.gz?alt=media"
   else:
     assert(not session)
     assert(not time)
@@ -438,11 +471,35 @@ async def get_netcdf_footprint(netcdf_footprint_url=None, time=None, location=No
     except Exception as e:
       return None
 
+def read_base64_netcdf_footprint(base64_netcdf_footprint):
+    bytes = base64.b64decode(json.loads(base64_netcdf_footprint.decode('utf-8'))["data"]["mediaLink"])
+    return netCDF4.Dataset('footprint.nc', memory=bytes)
 
 def read_compressed_netcdf_footprint(compressed_netcdf_footprint):
-  uncompressed = gzip.decompress(compressed_netcdf_footprint)
-  return netCDF4.Dataset('footprint.nc', memory=uncompressed)
+    uncompressed = gzip.decompress(compressed_netcdf_footprint)
+    return netCDF4.Dataset('footprint.nc', memory=uncompressed)
 
+
+def load_configmap_from_url(url):
+    response = requests.get(url)
+    response.raise_for_status()  # Raise an error if the request failed
+
+    # Load the top-level YAML
+    configmap = yaml.safe_load(response.text)
+
+    # Parse nested YAML strings in the 'data' section
+    full_config = dict(configmap)
+    data_section = configmap.get("data", {})
+    parsed_data = {}
+
+    for key, yaml_string in data_section.items():
+        try:
+            parsed_data[key] = yaml.safe_load(yaml_string)
+        except yaml.YAMLError as e:
+            parsed_data[key] = None
+
+    full_config["data"] = parsed_data
+    return full_config
 
 
 if __name__ == '__main__':

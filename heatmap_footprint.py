@@ -6,7 +6,7 @@ import io
 from pathlib import Path
 from typing import Tuple
 
-import matplotlib  # type: ignore
+#import matplotlib  # type: ignore
 import matplotlib.pyplot as plt  # type: ignore
 import numpy as np
 import numpy.typing as npt
@@ -16,7 +16,8 @@ from heatmap_grid import Grid
 
 from PIL import Image as im
 
-matplotlib.use("Agg")
+# non-GUI backend
+#matplotlib.use("Agg")
 
 
 def mercator_transform(
