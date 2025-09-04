@@ -16,6 +16,11 @@ from heatmap_grid import Grid
 
 from PIL import Image as im
 
+import rasterio
+from rasterio.transform import from_bounds
+from rasterio.warp import transform_bounds
+from rasterio.crs import CRS
+
 # non-GUI backend
 #matplotlib.use("Agg")
 
@@ -84,8 +89,6 @@ def mercator_transform(
 class Footprint:
     def __init__(self, nc: Dataset):
         """Representation of gridded 2 or 3 dimensional data."""
-        #self.nc_bytes = nc_bytes
-
         keys = list(nc.variables.keys())
         self.x = nc.variables[keys[0]][:].filled()
         self.y = nc.variables[keys[1]][:].filled()
@@ -110,9 +113,8 @@ class Footprint:
     @classmethod
     def from_path(cls, path: Path):
         """Load footprint from a NetCDF file."""
-        with open(path, "rb") as file_obj:
-            nc_bytes = file_obj.read()
-        return cls(nc_bytes)
+        with Dataset(path, "r") as nc:
+            return cls(nc)
 
     def create_image(
         self,
@@ -133,6 +135,8 @@ class Footprint:
         Returns:
             bytes: bytes representation of png image.
         """
+        format = kwargs.get("format", "png").lower()
+
         image = self.values
 
         while len(image.shape) > 2:
@@ -160,18 +164,55 @@ class Footprint:
         image = ((image - vmin) / (vmax - vmin)) * 255.0
         image = np.nan_to_num(image).astype(np.uint8)
 
-        # Apply colormap
-        cmap = plt.get_cmap(kwargs.get('cmap'))
-        image_colored = cmap(image)
+        if format == "geotiff":
+            # Apply colormap to normalized image
+            cmap = plt.get_cmap(kwargs.get('cmap'))
+            image_colored = cmap(image)  # shape: (H, W, 4) — RGBA in [0, 1]
 
-        # Convert to PIL Image
-        image_colored[:, :, 3] = alpha[:, :, 0]
-        image_pil = im.fromarray((image_colored * 255.0).astype(np.uint8))
+            # Replace alpha channel with NaN mask
+            image_colored[:, :, 3] = alpha[:, :, 0]  # binary alpha mask: 1 = visible, 0 = transparent
 
-        img_byte_arr = io.BytesIO()
-        image_pil.save(img_byte_arr, format='PNG', compress_level=2)
+            # Scale to 0–255 and convert to uint8
+            image_rgba = (image_colored * 255.0).astype(np.uint8)  # shape: (H, W, 4)
 
-        return img_byte_arr.getvalue()
+            height, width, _ = image_rgba.shape
+            bounds = (self.grid.xmin, self.grid.ymin, self.grid.xmax, self.grid.ymax)
+            if mercator:
+                # Transform bounds from EPSG:4326 to EPSG:3857
+                bounds = transform_bounds("EPSG:4326", "EPSG:3857", *bounds, densify_pts=21)
+            transform = from_bounds(*bounds, width=width, height=height)
+            crs = CRS.from_epsg(3857 if mercator else 4326)
+
+            # Create GeoTIFF in memory with 4 bands (R, G, B, A)
+            img_byte_arr = io.BytesIO()
+            with rasterio.MemoryFile() as memfile:
+                with memfile.open(
+                    driver="GTiff",
+                    height=height,
+                    width=width,
+                    count=4,  # RGBA
+                    dtype='uint8',
+                    transform=transform,
+                    crs=crs,
+                    photometric='RGB',  # Still needed even for RGBA
+                ) as dataset:
+                    for i in range(4):
+                        dataset.write(image_rgba[:, :, i], i + 1)
+                img_byte_arr.write(memfile.read())
+            return img_byte_arr.getvalue()
+        else:
+            # Apply colormap
+            cmap = plt.get_cmap(kwargs.get('cmap'))
+            image_colored = cmap(image)
+
+            # Convert to PIL Image
+            image_colored[:, :, 3] = alpha[:, :, 0]
+            image_pil = im.fromarray((image_colored * 255.0).astype(np.uint8))
+
+            img_byte_arr = io.BytesIO()
+            image_pil.save(img_byte_arr, format='PNG', compress_level=2)
+
+            return img_byte_arr.getvalue()
 
     def _validate_raster_attributes(self, x):
         """Ensure cell-by-cell operations are valid"""

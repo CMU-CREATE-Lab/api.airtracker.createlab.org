@@ -23,6 +23,11 @@ from heatmap_footprint import Footprint
 from timezonefinder import TimezoneFinder
 import logging
 import yaml
+import tempfile
+import rasterio
+from rasterio.transform import from_bounds
+from pyproj import Transformer
+import numpy as np
 
 # TODO: User can set output image size?
 MAP_WIDTH_PIXELS = 640
@@ -31,6 +36,8 @@ MAP_HEIGHT_PIXELS = 597
 NUM_REQUESTS_IN_PARALLEL = 25
 MAX_NUM_DATES_TO_PARSE = 750
 
+CITIES_DATA_URL = "https://storage.googleapis.com/air-tracker-edf-website/prod/assets/data/cities/cities.json"
+
 app = Flask(__name__)
 
 # TODO: Store in a different way?
@@ -38,6 +45,7 @@ credentials = json.load(open("credentials.json"))
 
 # Logging setup
 logging.basicConfig(filename='logging.log', level=logging.DEBUG, format=f'%(asctime)s %(levelname)s %(name)s %(threadName)s : %(message)s')
+
 
 # Any error we don't explicitly catch in our code falls to here
 @app.errorhandler(Exception)
@@ -51,12 +59,24 @@ def exception_fallback_handler(error):
     else:
         return return_error("Unknown error occurred. Please reach out to support.")
 
+
+@app.route('/docs')
+def redirect_to_docs():
+    # load iframe of https://storage.googleapis.com/air-tracker-edf-website/prod/assets/data/api.html
+    return requests.get("https://storage.googleapis.com/air-tracker-edf-website/prod/assets/data/api.html").content
+
 # The route() function of the Flask class is a decorator,
 # which tells the application which URL should call
 # the associated function.
+@app.route('/favicon.ico')
+def ignore_favicon():
+    return '', 204
+
+
 @app.route('/')
 def api_description():
     return 'Available API calls: \n /get_footprint \n /get_heatmap'
+
 
 @app.route('/get_footprint')
 def get_footprint():
@@ -73,6 +93,8 @@ def get_footprint():
     # Dates come in is ISO8601 format
     time = request.args.get('time') or request.args.get('t')
     tz = request.args.get('tz')
+    format = request.args.get("format", "png").lower()
+    is_real_time = request.args.get('isRealTime', 'false').lower() == 'true'
 
     if not tz:
         tz_finder = TimezoneFinder()
@@ -91,20 +113,68 @@ def get_footprint():
     show_basemap = request.args.get('showBasemap', default=True, type=lambda v: v.lower() == 'true')
     show_contribution_likelihoods = request.args.get('showContributionLikelihoods', default=False, type=lambda v: v.lower() == 'true')
 
-    footprint_url = f"https://storage.googleapis.com/air-tracker-edf-prod/by-simulation-id/{time}/{map_center['lon']}/{map_center['lat']}/1/footprint.png"
-    footprint_metadata_url = f"https://storage.googleapis.com/storage/v1/b/air-tracker-edf-prod/o/by-simulation-id%2F{time}%2F{map_center['lon']}%2F{map_center['lat']}%2F1%2Ffootprint.png"
+    cities_data = requests.get(CITIES_DATA_URL).json()["cities"]
+    domain = None
+    for city in cities_data.values():  # use .values() to get the dicts
+        bounds = city.get("click_bounds")
+        if bounds and is_in_bounds(map_center['lat'], map_center['lon'], bounds):
+            domain = city["domain_name"]
+            break
+
+    if is_real_time and not domain:
+        return return_error("Domain data not available for the provided lat,lon.")
+
+    if format == "netcdf":
+        if is_real_time:
+            formatted_time = parse_time_for_realtime(time)
+            footprint_url = f"https://api2.airtracker.createlab.org/get_footprint?lat={map_center['lat']}&lon={map_center['lon']}&time={formatted_time}&region={domain}&asNetCDF=true"
+            logging.info(f"Fetching footprint from: {footprint_url}")
+
+            footprint_netcdf = read_base64_netcdf_footprint(requests.get(footprint_url).content, return_bytes=True)
+        else:
+            footprint_url = f"https://storage.googleapis.com/download/storage/v1/b/air-tracker-edf-prod/o/by-simulation-id%2F{time}%2F{map_center['lon']}%2F{map_center['lat']}%2F1%2Ffootprint.nc.gz?alt=media"
+
+            response = requests.get(footprint_url, stream=True)
+            response.raise_for_status()
+            footprint_netcdf = response.raw
+
+        return send_file(
+            footprint_netcdf,
+            mimetype="application/x-netcdf",
+            as_attachment=True,
+            download_name="footprint.nc"
+        )
 
     map_url = f"https://maps.googleapis.com/maps/api/staticmap?center={map_center['lat']},{map_center['lon']}&zoom={map_zoom}&size={MAP_WIDTH_PIXELS}x{MAP_HEIGHT_PIXELS}&scale=1&key={credentials['google_api']}"
 
-    try:
-        response = requests.get(footprint_url, stream=True)
-        response.raise_for_status()
-        footprint_img = response.raw
-    except requests.exceptions.HTTPError as e:
-        return return_error("Invalid footprint lat,lon provided or footprint not available at that location or specific time.")
+    if is_real_time:
+        formatted_time = parse_time_for_realtime(time)
+        footprint_url = f"https://api2.airtracker.createlab.org/get_footprint?lat={map_center['lat']}&lon={map_center['lon']}&time={formatted_time}&region={domain}"
+        logging.info(f"Fetching footprint from: {footprint_url}")
+        try:
+            response = requests.get(footprint_url)
+            response.raise_for_status()
+            decoded_json = json.loads(response.content.decode('utf-8'))
+            header, encoded_footprint = decoded_json["data"]["mediaLink"].split(",", 1)
+            image_data = base64.b64decode(encoded_footprint)
+            original_footprint = Image.open(BytesIO(image_data))
+            footprint_metadata = {"metadata": decoded_json["data"]["metadata"]}
+        except requests.exceptions.HTTPError as e:
+            logging.error(e)
+            return return_error("Invalid footprint lat,lon provided or footprint not available at that location or specific time.")
+    else:
+        footprint_url = f"https://storage.googleapis.com/air-tracker-edf-prod/by-simulation-id/{time}/{map_center['lon']}/{map_center['lat']}/1/footprint.png"
+        footprint_metadata_url = f"https://storage.googleapis.com/storage/v1/b/air-tracker-edf-prod/o/by-simulation-id%2F{time}%2F{map_center['lon']}%2F{map_center['lat']}%2F1%2Ffootprint.png"
+        try:
+            response = requests.get(footprint_url, stream=True)
+            response.raise_for_status()
+            footprint_img = response.raw
+            original_footprint = Image.open(footprint_img)
+            footprint_metadata = requests.get(footprint_metadata_url, stream=True).json()
+        except requests.exceptions.HTTPError as e:
+            logging.error(e)
+            return return_error("Invalid footprint lat,lon provided or footprint not available at that location or specific time.")
 
-    original_footprint = Image.open(footprint_img)
-    footprint_metadata = requests.get(footprint_metadata_url, stream=True).json()
     original_pixel_map = original_footprint.load()
 
     # TODO: Check if Google response valid?
@@ -138,6 +208,45 @@ def get_footprint():
                         a = max(0, 255 - s * gain)
                 new_pixel_map[x,y] = (r,g,b,a)
 
+    if format == "geotiff":
+        # Use the RGBA footprint directly (no warping)
+        image_rgba = np.array(new_footprint.convert("RGBA"))
+        height, width, _ = image_rgba.shape
+
+        # Original footprint bounds + offsets
+        xmin = float(footprint_metadata["metadata"]["xmin"]) + lonOffset
+        xmax = float(footprint_metadata["metadata"]["xmax"]) + lonOffset
+        ymin = float(footprint_metadata["metadata"]["ymin"]) + latOffset
+        ymax = float(footprint_metadata["metadata"]["ymax"]) + latOffset
+
+        # Transform bounds to Web Mercator
+        transformer = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
+        xmin_3857, ymin_3857 = transformer.transform(xmin, ymin)
+        xmax_3857, ymax_3857 = transformer.transform(xmax, ymax)
+
+        transform = from_bounds(xmin_3857, ymin_3857, xmax_3857, ymax_3857, width, height)
+
+        memfile = rasterio.MemoryFile()
+        with memfile.open(
+            driver="GTiff",
+            height=height,
+            width=width,
+            count=4,
+            dtype='uint8',
+            transform=transform,
+            crs="EPSG:3857",
+            photometric='RGB'
+        ) as dataset:
+            for i in range(4):
+                dataset.write(image_rgba[:, :, i], i + 1)
+
+        return send_file(
+            memfile,
+            mimetype="image/tiff",
+            as_attachment=True,
+            download_name="footprint.tif"
+        )
+
     transformed_overlay = get_transformed_overlay(map_center, map_zoom, footprint_metadata, new_footprint, show_contribution_likelihoods, latOffset, lonOffset)
 
     final_output = transformed_overlay
@@ -165,14 +274,25 @@ async def get_heatmap():
 
     [map_center, map_zoom, latOffset, lonOffset] = get_formatted_view(view_obj)
 
-    domain = request.args.get('region')
     is_real_time = request.args.get('isRealTime', 'false').lower() == 'true'
+    format = request.args.get("format", "png").lower()
 
     # Dates come in is ISO8601 format
     times = request.args.get('times') or request.args.get('ts')
     # We also support rrule expression to generate list of dates on the server side
     rrule = request.args.get('rrule')
     timestamps = []
+
+    cities_data = requests.get(CITIES_DATA_URL).json()["cities"]
+    domain = None
+    for city in cities_data.values():  # use .values() to get the dicts
+        bounds = city.get("click_bounds")
+        if bounds and is_in_bounds(map_center['lat'], map_center['lon'], bounds):
+            domain = city["domain_name"]
+            break
+
+    if is_real_time and not domain:
+        return return_error("Domain data not available for the provided lat,lon.")
 
     if times:
         tz = request.args.get('tz')
@@ -227,7 +347,7 @@ async def get_heatmap():
     for idx, netcdf in enumerate(netcdf_files):
         if netcdf is None:
             continue
-        #f = read_compressed_netcdf_footprint(netcdf)
+
         footprint = netcdf.variables['foot'][:]
 
         if first:
@@ -248,6 +368,68 @@ async def get_heatmap():
     mean = sum / num_processed_timestamps
     mean_dataset.variables['foot'] = mean
 
+    if format == "netcdf":
+        with tempfile.NamedTemporaryFile(suffix=".nc") as tmp:
+            new_ds = netCDF4.Dataset(tmp.name, mode='w', format='NETCDF4')
+
+            # --- Copy global attributes ---
+            if hasattr(mean_dataset, 'ncattrs'):
+                for attr_name in mean_dataset.ncattrs():
+                    new_ds.setncattr(attr_name, mean_dataset.getncattr(attr_name))
+
+            # --- Copy dimensions ---
+            if hasattr(mean_dataset, 'dimensions'):
+                for name, dimension in mean_dataset.dimensions.items():
+                    new_ds.createDimension(name, (len(dimension) if not dimension.isunlimited() else None))
+
+            # --- Copy variables ---
+            for name, variable in mean_dataset.variables.items():
+                if hasattr(variable, 'dimensions'):
+                    # netCDF4.Variable path
+                    dtype = variable.dtype
+                    dims = variable.dimensions
+                    data = mean if name == 'foot' else variable[:]
+                else:
+                    # MaskedArray or ndarray path
+                    data = mean if name == 'foot' else variable
+                    dtype = data.dtype
+                    dims = tuple(f"dim_{i}" for i in range(data.ndim))
+
+                    # Ensure fabricated dims exist
+                    for i, size in enumerate(data.shape):
+                        if dims[i] not in new_ds.dimensions:
+                            new_ds.createDimension(dims[i], size)
+
+                # Ensure dimensions exist before creating variable
+                for dim in dims:
+                    if dim not in new_ds.dimensions:
+                        if hasattr(mean_dataset, 'dimensions') and dim in mean_dataset.dimensions:
+                            new_ds.createDimension(dim, len(mean_dataset.dimensions[dim]))
+                        else:
+                            # Fallback size from data
+                            idx = dims.index(dim)
+                            new_ds.createDimension(dim, data.shape[idx])
+
+                new_var = new_ds.createVariable(name, dtype, dims, zlib=True)
+
+                if hasattr(variable, 'ncattrs'):
+                    for attr_name in variable.ncattrs():
+                        new_var.setncattr(attr_name, variable.getncattr(attr_name))
+
+                new_var[:] = data
+
+            new_ds.close()
+            tmp.seek(0)
+            buf = BytesIO(tmp.read())
+
+        return send_file(
+            buf,
+            mimetype="application/x-netcdf",
+            as_attachment=True,
+            download_name="heatmap.nc"
+        )
+
+
     #colors = ['#F9F9F9', '#FFDB9D', '#FE9367', '#D7456D', '#7E2482', '#430F75']
     #colors = ['#F9F9F9', '#07EFF7', '#658CF8', '#7C14F5', '#B71AF5', '#FB23F5']
     colors = ['#F9F9F9','#07EFF7','#658CF8','#658CF8','#7C14F5','#7C14F5','#B71AF5','#B71AF5','#FB23F5','#FB23F5','#FB23F5']
@@ -261,7 +443,7 @@ async def get_heatmap():
         #cmap = matplotlib.colors.ListedColormap(colors, name='custom_cmap')
         cmap = matplotlib.colors.LinearSegmentedColormap.from_list('custom_cmap', colors)
 
-    png_bytes = Footprint(mean_dataset).create_image(log10=True, cmap=cmap, vmin=-4, vmax=0)
+    image_bytes = Footprint(mean_dataset).create_image(log10=True, cmap=cmap, vmin=-4, vmax=0, format=format)
 
     if is_real_time:
         domain_config = load_configmap_from_url("https://storage.googleapis.com/air-tracker-edf-website/prod/assets/data/cities/domains.yaml")
@@ -281,15 +463,22 @@ async def get_heatmap():
         footprint_metadata = requests.get(footprint_metadata_url, stream=True).json()
 
     if for_overlay:
-        b64_string = f'data:image/png;base64,' + base64.b64encode(png_bytes).decode('utf8')
+        b64_string = f'data:image/png;base64,' + base64.b64encode(image_bytes).decode('utf8')
         content = {'metadata': footprint_metadata['metadata'], 'image': b64_string}
         gzipped_content = gzip.compress(json.dumps(content).encode('utf8'), 5)
         response = make_response(gzipped_content)
         response.headers['Content-length'] = len(gzipped_content)
         response.headers['Content-Encoding'] = 'gzip'
         return response
+    elif format == "geotiff":
+        return serve_image_from_memory(
+            image=image_bytes,
+            is_bytes=True,
+            mimetype='image/tiff',
+            download_name='heatmap.tif'
+        )
     else:
-        new_footprint = Image.open(BytesIO(png_bytes))
+        new_footprint = Image.open(BytesIO(image_bytes))
 
         # TODO: Check if Google response valid?
         base_map = requests.get(map_url, stream=True).raw if show_basemap else None
@@ -316,6 +505,14 @@ async def gather_with_concurrency(n, *coros):
         async with semaphore:
             return await coro
     return await asyncio.gather(*(sem_coro(c) for c in coros))
+
+
+def parse_time_for_realtime(time):
+    date_part, time_part = time.split('T')
+    year, month, day = date_part.split('-')
+    hour = time_part.split('-')[0]
+    formatted_time = year + month + day + hour
+    return formatted_time
 
 
 def get_formatted_view(view_obj):
@@ -350,7 +547,7 @@ def alter_overlay_opacity(overlay, opacity):
     # Put alpha on the copy at 80%
     tmp.putalpha(round(255 * opacity))
     # merge overlay with mask
-    return overlay.paste(tmp, overlay)
+    overlay.paste(tmp, overlay)
 
 
 def get_transformed_overlay(map_center, map_zoom, footprint_metadata, new_footprint, show_contribution_likelihoods, latOffset, lonOffset):
@@ -406,14 +603,20 @@ def return_error(msg):
     return response
 
 
-def serve_image_from_memory(image=None, is_bytes=False):
-    if not is_bytes:
-        img_io = BytesIO()
-        image.save(img_io, 'PNG')
-    else:
+def serve_image_from_memory(image=None, is_bytes=False, format='PNG', mimetype='image/png', download_name=None):
+    if is_bytes:
         img_io = BytesIO(image)
+    else:
+        img_io = BytesIO()
+        image.save(img_io, format)
     img_io.seek(0)
-    return send_file(img_io, mimetype='image/png')
+    return send_file(
+        img_io,
+        mimetype=mimetype,
+        as_attachment=bool(download_name),
+        download_name=download_name
+    )
+
 
 # Transform x from the space defined by from_min-from_max into the space defined by to_min-to_max
 def one_dim_lin_xform(x: float, from_min: float, from_max: float, to_min: float, to_max: float):
@@ -448,14 +651,10 @@ async def get_and_read_netcdf_footprint(netcdf_footprint_url=None, time=None, lo
         return read_compressed_netcdf_footprint(netcdf_data)
 
 
-
 async def get_netcdf_footprint(netcdf_footprint_url=None, time=None, location=None, session=None, domain=None, is_real_time=False):
   if not netcdf_footprint_url:
     if is_real_time:
-        date_part, time_part = time.split('T')
-        year, month, day = date_part.split('-')
-        hour = time_part.split('-')[0]
-        formatted_time = year + month + day + hour
+        formatted_time = parse_time_for_realtime(time)
         netcdf_footprint_url = f"https://api2.airtracker.createlab.org/get_footprint?lat={location['lat']}&lon={location['lon']}&time={formatted_time}&region={domain}&asNetCDF=true"
     else:
         netcdf_footprint_url = f"https://storage.googleapis.com/download/storage/v1/b/air-tracker-edf-prod/o/by-simulation-id%2F{time}%2F{location['lon']}%2F{location['lat']}%2F1%2Ffootprint.nc.gz?alt=media"
@@ -464,6 +663,8 @@ async def get_netcdf_footprint(netcdf_footprint_url=None, time=None, location=No
     assert(not time)
     assert(not location)
 
+  logging.info(f"Fetching netcdf footprint from: {netcdf_footprint_url}")
+
   async with session.get(netcdf_footprint_url) as response:
     try:
       response.raise_for_status()
@@ -471,9 +672,13 @@ async def get_netcdf_footprint(netcdf_footprint_url=None, time=None, location=No
     except Exception as e:
       return None
 
-def read_base64_netcdf_footprint(base64_netcdf_footprint):
-    bytes = base64.b64decode(json.loads(base64_netcdf_footprint.decode('utf-8'))["data"]["mediaLink"])
-    return netCDF4.Dataset('footprint.nc', memory=bytes)
+
+def read_base64_netcdf_footprint(base64_netcdf_footprint, return_bytes=False):
+    decoded_bytes = base64.b64decode(json.loads(base64_netcdf_footprint.decode('utf-8'))["data"]["mediaLink"])
+    if return_bytes:
+        return BytesIO(decoded_bytes)
+    return netCDF4.Dataset('footprint.nc', memory=decoded_bytes)
+
 
 def read_compressed_netcdf_footprint(compressed_netcdf_footprint):
     uncompressed = gzip.decompress(compressed_netcdf_footprint)
@@ -501,6 +706,10 @@ def load_configmap_from_url(url):
     full_config["data"] = parsed_data
     return full_config
 
+def is_in_bounds(lat, lon, bounds):
+    """Check if a point is within the given bounds dictionary."""
+    return bounds["ymin"] <= lat <= bounds["ymax"] and bounds["xmin"] <= lon <= bounds["xmax"]
 
-if __name__ == '__main__':
-    app.run(host='127.0.0.1', port=8080, debug=True)
+
+# if __name__ == '__main__':
+#     app.run(host='127.0.0.1', port=8080, debug=True)
